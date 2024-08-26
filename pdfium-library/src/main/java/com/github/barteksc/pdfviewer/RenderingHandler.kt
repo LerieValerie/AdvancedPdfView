@@ -14,10 +14,6 @@ import android.util.Log
 import com.github.barteksc.pdfviewer.RenderingHandler.RenderingTask
 import com.github.barteksc.pdfviewer.exception.PageRenderingException
 import com.github.barteksc.pdfviewer.model.PagePart
-import com.github.barteksc.pdfviewer.util.addArea
-import kotlin.math.abs
-import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
@@ -28,7 +24,7 @@ import kotlin.math.roundToInt
 internal class RenderingHandler(
     looper: Looper,
     private val pdfView: PDFView
-): Handler(looper) {
+) : Handler(looper) {
 
     private val renderBounds = RectF()
     private val roundedRenderBounds = Rect()
@@ -236,124 +232,7 @@ internal class RenderingHandler(
         )
 
         val searchQuery = renderingTask.searchQuery ?: ""
-        if (searchQuery.isNotBlank()) {
-            val search = pdfFile?.newPageSearch(
-                pageIndex = renderingTask.page,
-                query = searchQuery,
-                matchCase = false,
-                matchWholeWord = false
-            )
-            if (search?.hasNext() == true) {
-                while (true) {
-                    val rect = search.searchNext() ?: break
-                    //If thumbnail
-                    if (roundedRenderBounds.width() <= nativePageWidth.toInt()) {
-                        val currentRenderedRealRectByBounds = RectF(
-                            renderingTask.bounds.left * nativePageWidth,
-                            renderingTask.bounds.top * nativePageHeight,
-                            renderingTask.bounds.right * nativePageWidth,
-                            renderingTask.bounds.bottom * nativePageHeight
-                        )
-                        if (rect.intersect(currentRenderedRealRectByBounds)) {
-                            val l1 = rect.left * roundedRenderBounds.width() / nativePageWidth
-                            val t1 =
-                                roundedRenderBounds.height() - rect.top * roundedRenderBounds.height() / nativePageHeight
-                            val r1 = rect.right * roundedRenderBounds.width() / nativePageWidth
-                            val b1 =
-                                roundedRenderBounds.height() - rect.bottom * roundedRenderBounds.height() / nativePageHeight
-                            var strLen = searchQuery.length
-                            if (strLen < 1) {
-                                strLen = 1
-                            }
-                            val oneSymbolWidth = r1 - l1
-                            val w1 = l1 + oneSymbolWidth * strLen
-                            p.color = pdfFile.textHighlightColor
-                            c.drawRect(
-                                RectF(
-                                    l1,
-                                    t1,
-                                    w1,
-                                    b1
-                                ).also {
-                                    it.addArea(
-                                        scaleFactorVertical = 0.3f
-                                    )
-                                },
-                                p
-                            )
-                        } else {
-                            break
-                        }
-                    } else {
-                        val rectForBitmap = RectF(
-                            renderingTask.bounds.left * renderBounds.width(),
-                            renderingTask.bounds.top * renderBounds.height(),
-                            renderingTask.bounds.right * renderBounds.width(),
-                            renderingTask.bounds.bottom * renderBounds.height()
-                        )
-                        val left = rect.left / nativePageWidth * renderBounds.width()
-                        val rr = rect.right / nativePageWidth * renderBounds.width()
-                        var strLen = searchQuery.length
-                        if (strLen < 1) {
-                            strLen = 1
-                        }
-                        val symbolWidth = rr - left
-                        val ww1 = left + (symbolWidth * (strLen + 1))
-                        val rectForSearch = RectF(
-                            left,
-                            renderBounds.height() - rect.top / nativePageHeight * renderBounds.height(),
-                            ww1,
-                            renderBounds.height() - rect.bottom / nativePageHeight * renderBounds.height()
-                        )
-                        if (rectForSearch.intersect(rectForBitmap)) {
 
-                            val l1 = abs(
-                                abs(rectForSearch.left) - abs(rectForBitmap.left)
-                            )
-                            val t1 = abs(
-                                abs(rectForSearch.top) - abs(rectForBitmap.top)
-                            )
-                            val r1 = l1 + rectForSearch.width()
-                            val b1 = t1 + rectForSearch.height()
-
-                            val realRect = RectF(
-                                max(
-                                    0f,
-                                    min(
-                                        pageBitmap.width.toFloat(),
-                                        l1
-                                    )
-                                ),
-                                max(
-                                    0f,
-                                    min(
-                                        pageBitmap.height.toFloat(),
-                                        t1
-                                    )
-                                ),
-                                min(
-                                    r1,
-                                    pageBitmap.width.toFloat()
-                                ),  /*min(pageBitmap.getHeight(), b1)*/
-                                min(
-                                    pageBitmap.height.toFloat(),
-                                    b1
-                                )
-                            ).also {
-                                it.addArea(
-                                    scaleFactorVertical = 0.3f
-                                )
-                            }
-                            p.color = pdfFile.textHighlightColor
-                            c.drawRect(
-                                realRect,
-                                p
-                            )
-                        }
-                    }
-                }
-            }
-        }
         pdfFile?.renderPageBitmap(
             pageBitmap,
             renderingTask.page,
@@ -385,7 +264,7 @@ internal class RenderingHandler(
             1 / (pageSliceBounds?.width() ?: 0f),
             1 / (pageSliceBounds?.height() ?: 0f)
         )
-        renderBounds[0f, 0f, width.toFloat()] = height.toFloat()
+        renderBounds.set(0f, 0f, width.toFloat(), height.toFloat())
         renderMatrix.mapRect(renderBounds)
         renderBounds.round(roundedRenderBounds)
     }

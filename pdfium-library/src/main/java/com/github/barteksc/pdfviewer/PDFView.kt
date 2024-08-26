@@ -8,15 +8,18 @@ import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.graphics.PaintFlagsDrawFilter
+import android.graphics.Point
 import android.graphics.PointF
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.HandlerThread
 import android.util.AttributeSet
 import android.util.Log
 import android.widget.RelativeLayout
-import androidx.annotation.ColorInt
+import androidx.core.content.ContextCompat
+import androidx.core.graphics.toRectF
 import com.github.barteksc.pdfviewer.decoding.DecodingRunner
 import com.github.barteksc.pdfviewer.exception.PageRenderingException
 import com.github.barteksc.pdfviewer.link.DefaultLinkHandler
@@ -25,30 +28,48 @@ import com.github.barteksc.pdfviewer.listener.Callbacks
 import com.github.barteksc.pdfviewer.listener.OnDrawListener
 import com.github.barteksc.pdfviewer.listener.OnErrorListener
 import com.github.barteksc.pdfviewer.listener.OnLoadCompleteListener
+import com.github.barteksc.pdfviewer.listener.OnLoadStartListener
 import com.github.barteksc.pdfviewer.listener.OnLongPressListener
 import com.github.barteksc.pdfviewer.listener.OnPageChangeListener
 import com.github.barteksc.pdfviewer.listener.OnPageErrorListener
 import com.github.barteksc.pdfviewer.listener.OnPageScrollListener
 import com.github.barteksc.pdfviewer.listener.OnRenderListener
 import com.github.barteksc.pdfviewer.listener.OnTapListener
+import com.github.barteksc.pdfviewer.listener.OnTextSearchListener
+import com.github.barteksc.pdfviewer.listener.OnTextSelectListener
+import com.github.barteksc.pdfviewer.model.LinkTapEvent
 import com.github.barteksc.pdfviewer.model.PagePart
 import com.github.barteksc.pdfviewer.scroll.ScrollHandle
-import com.github.barteksc.pdfviewer.source.AssetSource
 import com.github.barteksc.pdfviewer.source.DocumentSource
-import com.github.barteksc.pdfviewer.source.FileSource
+import com.github.barteksc.pdfviewer.source.RandomAccessReaderSource
+import com.github.barteksc.pdfviewer.util.Color.textSelectionColor
 import com.github.barteksc.pdfviewer.util.ColorScheme
 import com.github.barteksc.pdfviewer.util.Constants
 import com.github.barteksc.pdfviewer.util.FitPolicy
 import com.github.barteksc.pdfviewer.util.MathUtils.limit
 import com.github.barteksc.pdfviewer.util.SnapEdge
 import com.github.barteksc.pdfviewer.util.Util.getDP
+import com.sovworks.projecteds.domain.common.required
+import com.sovworks.projecteds.domain.common.util.LoadingState
+import com.sovworks.projecteds.domain.common.util.orFalse
+import com.sovworks.projecteds.domain.filemanager.MediaRandomAccessReaderDataSource
+import io.ktor.http.parseUrlEncodedParameters
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.withContext
 import org.benjinus.pdfium.Bookmark
 import org.benjinus.pdfium.Link
 import org.benjinus.pdfium.Meta
+import org.benjinus.pdfium.search.SearchRect
+import org.benjinus.pdfium.search.SearchRectVisibilityMode
+import org.benjinus.pdfium.search.SearchRectWithVisibility
+import org.benjinus.pdfium.search.SelectionRect
+import org.benjinus.pdfium.search.SelectionRectWithIndex
 import org.benjinus.pdfium.util.Size
 import org.benjinus.pdfium.util.SizeF
-import java.io.File
-import java.util.ArrayList
+import kotlin.math.max
+import kotlin.math.min
+
 
 /**
  * It supports animations, zoom, cache, and swipe.
@@ -73,7 +94,7 @@ import java.util.ArrayList
 class PDFView(
     context: Context?,
     set: AttributeSet?
-): RelativeLayout(
+) : RelativeLayout(
     context,
     set
 ) {
@@ -84,7 +105,7 @@ class PDFView(
         return searchQuery
     }
 
-    fun setSearchQuery(searchQuery: String) {
+    fun updatePagesWithSearch(searchQuery: String) {
         this.searchQuery = searchQuery
         loadPages()
     }
@@ -115,8 +136,35 @@ class PDFView(
      */
     private val dragPinchManager: DragPinchManager
 
+    fun scrollView(distanceX: Float, distanceY: Float) {
+        dragPinchManager.scrollView(distanceX, distanceY)
+    }
+
+    fun scrollToCurrentSearchItem(
+        searchRectWithVisibility: SearchRectWithVisibility,
+        isForward: Boolean
+    ) {
+        if (searchRectWithVisibility.visibilityMode == SearchRectVisibilityMode.VisibleWithScroll) {
+            val diffX = if (searchRectWithVisibility.deviceSearchRect.left < 0) {
+                searchRectWithVisibility.deviceSearchRect.left
+            } else if (searchRectWithVisibility.deviceSearchRect.right > width) {
+                -(searchRectWithVisibility.deviceSearchRect.right - width)
+            } else 0f
+
+            val diffY = if (isForward) {
+                searchRectWithVisibility.deviceSearchRect.top - height + height / 2
+            } else {
+                searchRectWithVisibility.deviceSearchRect.top - height / 2
+            }
+            scrollView(diffX, diffY)
+        }
+    }
+
     @JvmField
     var pdfFile: PdfFile? = null
+
+    val pdfFileRequired: PdfFile
+        get() = pdfFile.required
 
     /**
      * The index of the current sequence
@@ -173,6 +221,8 @@ class PDFView(
      */
     private val paint: Paint
 
+    private val selectionPaint: Paint
+
     /**
      * Paint object for drawing debug stuff
      */
@@ -198,8 +248,6 @@ class PDFView(
     private var nightMode = false
     private var searchQuery = ""
 
-    @ColorInt
-    private var textHighlightColor = Color.WHITE
     var isPageSnap = true
     var scrollHandle: ScrollHandle? = null
         private set
@@ -267,20 +315,25 @@ class PDFView(
      */
     private var waitingDocumentConfigurator: Configurator? = null
 
+    var startSelectionRect: SelectionRectWithIndex? = null
+
+    var endSelectionRect: SelectionRectWithIndex? = null
+
+    var selectionRects = listOf<RectF>()
+
+    fun clearSelection() {
+        startSelectionRect = null
+        endSelectionRect = null
+        selectionRects = listOf()
+        redraw()
+    }
+
     /**
      * Override defualt color scheme.
      */
     var colorScheme: ColorScheme? = null
         private set
 
-    fun getTextHighlightColor(): Int {
-        return textHighlightColor
-    }
-
-    fun setTextHighlightColor(textHighlightColor: Int) {
-        this.textHighlightColor = textHighlightColor
-        loadPages()
-    }
 
     private fun load(
         docSource: DocumentSource,
@@ -289,13 +342,14 @@ class PDFView(
     ) {
         check(isRecycled) { "Don't call load on a PDF View without recycling it first." }
         isRecycled = false
+        callbacks.callOnLoadStart()
         val runner = DecodingRunner(
             docSource,
             password,
             userPages,
             this
         )
-        runner.executeAsync(object: DecodingRunner.Callback {
+        runner.executeAsync(object : DecodingRunner.Callback {
             override fun onComplete(result: PdfFile?) {
                 loadComplete(result)
             }
@@ -731,11 +785,67 @@ class PDFView(
             callbacks.onDraw
         )
 
+        drawTextSelection(canvas)
+
         // Restores the canvas position
         canvas.translate(
             -currentXOffset,
             -currentYOffset
         )
+    }
+
+    private fun drawTextSelection(canvas: Canvas) {
+        selectionRects.forEachIndexed { index, rect ->
+            endSelectionRect?.selectionRect?.page?.let {
+                convertPageRectToDevice(rect, it)?.let { deviceRect ->
+                    canvas.drawRect(deviceRect, selectionPaint)
+                }
+            }
+        }
+
+        startSelectionRect?.let { selectionRect ->
+            convertPageRectToDevice(selectionRect.selectionRect.rect, selectionRect.selectionRect.page)?.let { deviceRect ->
+                val isStart =
+                    if (endSelectionRect != null) selectionRect.charIndex < endSelectionRect.required.charIndex else true
+                getDrawableWithBounds(deviceRect, isStart)?.let { drawable ->
+                    startSelectionRect = selectionRect.copy(
+                        iconRect = drawable.bounds
+                    )
+                    drawable.draw(canvas)
+                }
+            }
+        }
+
+        endSelectionRect?.let { selectionRect ->
+            convertPageRectToDevice(selectionRect.selectionRect.rect, selectionRect.selectionRect.page)?.let { deviceRect ->
+                val isStart =
+                    if (startSelectionRect != null) selectionRect.charIndex < startSelectionRect.required.charIndex else true
+                getDrawableWithBounds(deviceRect, isStart)?.let { drawable ->
+                    endSelectionRect = selectionRect.copy(
+                        iconRect = drawable.bounds
+                    )
+                    drawable.draw(canvas)
+                }
+            }
+        }
+    }
+
+    private fun convertPageRectToDevice(rectF: RectF, page: Int): RectF? {
+        val pageSize = pdfFileRequired.getScaledPageSize(
+            page,
+            zoom
+        )
+        val pagePoint = getPagePointAtOffsetAndZoom(page)
+
+        val mapped = pdfFileRequired.mapRectToDevice(
+            page,
+            pagePoint.x,
+            pagePoint.y,
+            pageSize.width.toInt(),
+            pageSize.height.toInt(),
+            rectF
+        )
+        return mapped
     }
 
     private fun drawWithListener(
@@ -941,11 +1051,11 @@ class PDFView(
             isScrollHandleInit = true
         }
         dragPinchManager.enable()
-        callbacks.callOnLoadComplete(pdfFile?.pagesCount ?: 0)
         jumpTo(
             defaultPage,
             false
         )
+        callbacks.callOnLoadComplete(pdfFile?.pagesCount ?: 0)
     }
 
     fun loadError(t: Throwable?) {
@@ -1033,7 +1143,7 @@ class PDFView(
             0f,
             0f
         )
-    ){
+    ) {
         if (pdfFile == null) {
             return
         }
@@ -1123,9 +1233,11 @@ class PDFView(
                 offX < currentXOffset -> {
                     ScrollDir.END
                 }
+
                 offX > currentXOffset -> {
                     ScrollDir.START
                 }
+
                 else -> {
                     ScrollDir.NONE
                 }
@@ -1221,12 +1333,15 @@ class PDFView(
             length >= pageLength -> {
                 SnapEdge.CENTER
             }
+
             currentOffset >= offset -> {
                 SnapEdge.START
             }
+
             offset - pageLength > currentOffset - length -> {
                 SnapEdge.END
             }
+
             else -> {
                 SnapEdge.NONE
             }
@@ -1538,17 +1653,12 @@ class PDFView(
     }
 
     /**
-     * Use an asset file as the pdf source
-     */
-    fun fromAsset(assetName: String?): Configurator {
-        return Configurator(AssetSource(assetName!!))
-    }
-
-    /**
      * Use a file as the pdf source
      */
-    fun fromFile(file: File): Configurator {
-        return Configurator(FileSource(file))
+    val documentSourceReadFlow = MutableSharedFlow<Unit>()
+
+    fun fromRandomAccessReader(mediaRandomAccessReaderDataSource: MediaRandomAccessReaderDataSource): Configurator {
+        return Configurator(RandomAccessReaderSource(mediaRandomAccessReaderDataSource, documentSourceReadFlow))
     }
 
     /**
@@ -1571,12 +1681,15 @@ class PDFView(
         private var enableDoubletap = true
         private var onDrawListener: OnDrawListener? = null
         private var onDrawAllListener: OnDrawListener? = null
+        private var onLoadStartListener: OnLoadStartListener? = null
         private var onLoadCompleteListener: OnLoadCompleteListener? = null
         private var onErrorListener: OnErrorListener? = null
         private var onPageChangeListener: OnPageChangeListener? = null
         private var onPageScrollListener: OnPageScrollListener? = null
         private var onRenderListener: OnRenderListener? = null
         private var onTapListener: OnTapListener? = null
+        private var onTextSelectListener: OnTextSelectListener? = null
+        private var onTextSearchListener: OnTextSearchListener? = null
         private var onLongPressListener: OnLongPressListener? = null
         private var onPageErrorListener: OnPageErrorListener? = null
         private var linkHandler: LinkHandler = DefaultLinkHandler(
@@ -1631,6 +1744,11 @@ class PDFView(
             return this
         }
 
+        fun onLoadStart(onLoadStartListener: OnLoadStartListener?): Configurator {
+            this.onLoadStartListener = onLoadStartListener
+            return this
+        }
+
         fun onPageScroll(onPageScrollListener: OnPageScrollListener?): Configurator {
             this.onPageScrollListener = onPageScrollListener
             return this
@@ -1663,6 +1781,16 @@ class PDFView(
 
         fun onTap(onTapListener: OnTapListener?): Configurator {
             this.onTapListener = onTapListener
+            return this
+        }
+
+        fun onTextSelect(onTextSelectListener: OnTextSelectListener): Configurator {
+            this.onTextSelectListener = onTextSelectListener
+            return this
+        }
+
+        fun onTextSearch(onTextSearchListener: OnTextSearchListener): Configurator {
+            this.onTextSearchListener = onTextSearchListener
             return this
         }
 
@@ -1749,14 +1877,6 @@ class PDFView(
             return this
         }
 
-        fun textHighlightColor(
-            @ColorInt
-            color: Int
-        ): Configurator {
-            textHighlightColor = color
-            return this
-        }
-
         fun load() {
             if (!hasSize) {
                 waitingDocumentConfigurator = this
@@ -1764,6 +1884,7 @@ class PDFView(
             }
             recycle()
             callbacks.setOnLoadComplete(onLoadCompleteListener)
+            callbacks.setOnLoadStart(onLoadStartListener)
             callbacks.onError = onErrorListener
             callbacks.onDraw = onDrawListener
             callbacks.onDrawAll = onDrawAllListener
@@ -1771,6 +1892,8 @@ class PDFView(
             callbacks.setOnPageScroll(onPageScrollListener)
             callbacks.setOnRender(onRenderListener)
             callbacks.setOnTap(onTapListener)
+            callbacks.setOnTextSelect(onTextSelectListener)
+            callbacks.setOnTextSearch(onTextSearchListener)
             callbacks.setOnLongPress(onLongPressListener)
             callbacks.setOnPageError(onPageErrorListener)
             callbacks.setLinkHandler(linkHandler)
@@ -1803,11 +1926,638 @@ class PDFView(
         }
     }
 
+    suspend fun clearSearch() {
+        pdfFile?.clearSearchHighlight()
+        updatePagesWithSearch("")
+    }
+
+    suspend fun highlightCurrentSearchIndex(currentIndex: Int, currentRect: RectF) {
+        pdfFile?.highlightCurrentSearchIndex(currentIndex, currentRect)
+
+        updatePagesWithSearch("$currentIndex")
+    }
+
+    private fun getSearchRectVisibilityMode(deviceSearchRect: RectF, isForward: Boolean): SearchRectVisibilityMode {
+        val searchRectVisibilityMode =
+            if (isForward) {
+                when {
+                    (deviceSearchRect.left >= 0 && deviceSearchRect.left < width && deviceSearchRect.top >= 0 && deviceSearchRect.top < height) ->
+                        SearchRectVisibilityMode.Visible
+
+                    (deviceSearchRect.top > height || deviceSearchRect.left < 0 || deviceSearchRect.right > width) ->
+                        SearchRectVisibilityMode.VisibleWithScroll
+
+                    else -> SearchRectVisibilityMode.Invisible
+                }
+            } else {
+                when {
+                    (deviceSearchRect.left >= 0 && deviceSearchRect.left < width && deviceSearchRect.top >= 0 && deviceSearchRect.top < height) ->
+                        SearchRectVisibilityMode.Visible
+
+                    (deviceSearchRect.top < 0 || deviceSearchRect.left < 0 || deviceSearchRect.right > width) ->
+                        SearchRectVisibilityMode.VisibleWithScroll
+
+                    else -> SearchRectVisibilityMode.Invisible
+                }
+            }
+
+        return searchRectVisibilityMode
+    }
+
+    private fun convertPageSearchRectToDevice(pageSearchRect: SearchRect): RectF? {
+        val pageSize = pdfFileRequired.getScaledPageSize(
+            pageSearchRect.page,
+            zoom
+        )
+
+        val pagePointAtOffsetAndZoom = getPagePointAtOffsetAndZoom(pageSearchRect.page)
+
+        val hasPage = pdfFileRequired.hasPage(pageSearchRect.page)
+        if (!hasPage) {
+            pdfFileRequired.openPage(pageSearchRect.page)
+        }
+
+        val mappedRect = pdfFileRequired.mapRectToDevice(
+            pageSearchRect.page,
+            pagePointAtOffsetAndZoom.x,
+            pagePointAtOffsetAndZoom.y,
+            pageSize.width.toInt(),
+            pageSize.height.toInt(),
+            pageSearchRect.rect
+        )
+
+        val mappedRectWithOffset = mappedRect?.let {
+            RectF(
+                it.left + currentXOffset,
+                it.top + currentYOffset,
+                it.right + currentXOffset,
+                it.bottom + currentYOffset
+            )
+        }
+
+        return mappedRectWithOffset
+    }
+
+    fun getCurrentSearchRectWithVisibility(inputIndex: Int, isForward: Boolean): SearchRectWithVisibility? {
+        val flattenSearchResults = pdfFile?.getFlattenSearchResults() ?: emptyList()
+        val isItemWithIndexVisible = isItemWithIndexVisible(inputIndex, flattenSearchResults)
+
+        val currentIndex = getCurrentIndex(isItemWithIndexVisible, isForward, inputIndex, flattenSearchResults)
+
+        var searchRectWithVisibility: SearchRectWithVisibility? = null
+
+        if (currentIndex != -1) {
+            if (isForward) {
+                for (i in currentIndex until flattenSearchResults.size) {
+                    val currentSearchRectWithVisibility = getSearchRectWithVisibility(flattenSearchResults, i, true)
+                    if (currentSearchRectWithVisibility != null) {
+                        searchRectWithVisibility = currentSearchRectWithVisibility
+                        break
+                    }
+                }
+            } else {
+                for (i in currentIndex downTo 0) {
+                    val currentSearchRectWithVisibility = getSearchRectWithVisibility(flattenSearchResults, i, false)
+                    if (currentSearchRectWithVisibility != null) {
+                        searchRectWithVisibility = currentSearchRectWithVisibility
+                        break
+                    }
+                }
+            }
+        }
+
+        return searchRectWithVisibility
+    }
+
+    private fun getSearchRectWithVisibility(
+        flattenSearchResults: List<SearchRect>,
+        index: Int,
+        isForward: Boolean
+    ): SearchRectWithVisibility? {
+        val searchResult = flattenSearchResults.getOrNull(index)
+        val currentSearchRectWithVisibility = searchResult?.let { searchRect ->
+            val deviceSearchRect = convertPageSearchRectToDevice(searchRect)
+            deviceSearchRect?.let {
+                val visibilityMode = getSearchRectVisibilityMode(it, isForward)
+                if (visibilityMode == SearchRectVisibilityMode.Visible || visibilityMode == SearchRectVisibilityMode.VisibleWithScroll) {
+                    SearchRectWithVisibility(
+                        searchRect,
+                        index,
+                        it,
+                        visibilityMode
+                    )
+                } else null
+            }
+        }
+        return currentSearchRectWithVisibility
+    }
+
+    private fun getCurrentIndex(
+        isItemWithIndexVisible: Boolean,
+        isForward: Boolean,
+        inputIndex: Int,
+        flattenSearchResults: List<SearchRect>
+    ): Int {
+        val currentIndex = if (isItemWithIndexVisible) {
+            if (isForward) {
+                val index = inputIndex + 1
+                if (index < 0) 0 else if (index < flattenSearchResults.size) index else flattenSearchResults.size - 1
+            } else {
+                val index = inputIndex - 1
+                if (index < 0) 0 else if (index < flattenSearchResults.size) index else flattenSearchResults.size - 1
+            }
+        } else {
+            var resCurrentIndex: Int = -1
+            if (isForward) {
+                for (i in flattenSearchResults.indices) {
+                    val currentIndex = getVisibleCurrentIndex(flattenSearchResults, i, true)
+
+                    if (currentIndex != null) {
+                        resCurrentIndex = currentIndex
+                        break
+                    }
+                }
+            } else {
+                for (i in flattenSearchResults.size - 1 downTo 0) {
+                    val currentIndex = getVisibleCurrentIndex(flattenSearchResults, i, false)
+
+                    if (currentIndex != null) {
+                        resCurrentIndex = currentIndex
+                        break
+                    }
+                }
+            }
+            resCurrentIndex
+        }
+        return currentIndex
+    }
+
+    private fun getVisibleCurrentIndex(
+        flattenSearchResults: List<SearchRect>,
+        index: Int,
+        isForward: Boolean
+    ): Int? {
+        val searchResult = flattenSearchResults.getOrNull(index)
+        val currentIndex = searchResult?.let { searchRect ->
+            val deviceSearchRect = convertPageSearchRectToDevice(searchRect)
+            deviceSearchRect?.let {
+                val visibilityMode = getSearchRectVisibilityMode(it, isForward)
+                if (visibilityMode == SearchRectVisibilityMode.Visible || visibilityMode == SearchRectVisibilityMode.VisibleWithScroll) {
+                    index
+                } else null
+            }
+        }
+        return currentIndex
+    }
+
+    private fun isItemWithIndexVisible(
+        inputIndex: Int,
+        flattenSearchResults: List<SearchRect>
+    ): Boolean {
+        val isItemWithIndexVisible =
+            if (inputIndex == -1) false
+            else {
+                val searchResult = flattenSearchResults.getOrNull(inputIndex)
+                searchResult?.let { searchRect ->
+                    val deviceSearchRect = convertPageSearchRectToDevice(searchRect)
+                    deviceSearchRect?.let {
+                        val visibilityMode = getSearchRectVisibilityMode(it, true)
+                        visibilityMode == SearchRectVisibilityMode.Visible
+                    }
+                } ?: false
+            }
+        return isItemWithIndexVisible
+    }
+
+    fun getCurrentSearchRectByIndex(index: Int): SearchRect? {
+        val flattenSearchResults = pdfFile?.getFlattenSearchResults() ?: emptyList()
+        return flattenSearchResults.getOrNull(index)
+    }
+
+    fun selectTextWithIndexes(page: Int, startIndex: Int, endIndex: Int) {
+        val startCharacterBox = pdfFileRequired.measureCharacterBox(page, startIndex)
+        val endCharacterBox = pdfFileRequired.measureCharacterBox(page, endIndex)
+
+        if (startCharacterBox != null && endCharacterBox != null) {
+            startSelectionRect = SelectionRectWithIndex(SelectionRect(page, startCharacterBox), startIndex, null)
+            endSelectionRect = SelectionRectWithIndex(SelectionRect(page, endCharacterBox), endIndex, null)
+
+            selectionRects = getSelectionRects(page)
+            callbacks.callOnTextSelect(selectionRects.isNotEmpty())
+        }
+        redraw()
+    }
+
+    fun getSelectionRects(page: Int): List<RectF> {
+        return if (startSelectionRect != null && endSelectionRect != null) {
+            val minIndex = min(startSelectionRect.required.charIndex, endSelectionRect.required.charIndex)
+            val maxIndex = max(startSelectionRect.required.charIndex, endSelectionRect.required.charIndex)
+
+            val count = maxIndex - minIndex + 1
+
+            pdfFileRequired.getCountRects(page, minIndex, count)?.let { rectsCount ->
+                val selectionRects = mutableListOf<RectF>()
+                for (i in 0 until rectsCount) {
+                    val currentRect = pdfFileRequired.getTextRect(page, i)
+                    currentRect?.let {
+                        selectionRects.add(it)
+                    }
+                }
+
+                selectionRects
+            } ?: emptyList()
+        } else emptyList()
+    }
+
+    private fun getDrawableWithBounds(rectF: RectF, isStart: Boolean): Drawable? {
+        return ContextCompat.getDrawable(context.required, org.benjinus.pdfium.R.drawable.ic_text_select)?.let { drawable ->
+            val startX = if (isStart) rectF.left.toInt() else rectF.right.toInt()
+            val startY = rectF.bottom.toInt()
+
+            drawable.setBounds(
+                startX - (drawable.intrinsicWidth * drawableWidthCoeff).toInt(),
+                startY - (drawable.intrinsicHeight * drawableHeightStartCoeff).toInt(),
+                startX + (drawable.intrinsicWidth * drawableWidthCoeff).toInt(),
+                startY + (drawable.intrinsicHeight * drawableHeightEndCoeff).toInt()
+            )
+            drawable
+        }
+    }
+
+    fun getSelectedText(): String? {
+        return startSelectionRect?.let { startSelectionRect ->
+            endSelectionRect?.let { endSelectionRect ->
+                val page = startSelectionRect.selectionRect.page
+                val startIndex = min(startSelectionRect.charIndex, endSelectionRect.charIndex)
+                val endIndex = max(startSelectionRect.charIndex, endSelectionRect.charIndex)
+                val countIndexes = endIndex - startIndex + 1
+
+                pdfFile?.extractCharacters(page, startIndex, countIndexes)
+            }
+        }
+    }
+
+    suspend fun searchAndHighlight(
+        searchQuery: String,
+        matchCase: Boolean,
+        matchWholeWord: Boolean,
+        loadingState: LoadingState
+    ) {
+        loadingState {
+            pdfFile?.searchAndHighlight(
+                searchQuery = searchQuery,
+                matchCase = matchCase,
+                matchWholeWord = matchWholeWord
+            )
+        }
+        updatePagesWithSearch(searchQuery)
+        callbacks.callOnTextSearch(true)
+    }
+
+    private fun getPagePointAtOffsetAndZoom(pageAtOffset: Int): Point {
+        return if (isSwipeVertical) {
+            Point(
+                /* x = */ pdfFileRequired.getSecondaryPageOffset(
+                    pageAtOffset,
+                    zoom
+                ).toInt(),
+
+                /* y = */ pdfFileRequired.getPageOffset(
+                    pageAtOffset,
+                    zoom
+                ).toInt()
+            )
+        } else {
+            Point(
+                /* x = */
+                pdfFileRequired.getPageOffset(
+                    pageAtOffset,
+                    zoom
+                ).toInt(),
+                /* y = */
+                pdfFileRequired.getSecondaryPageOffset(
+                    pageAtOffset,
+                    zoom
+                ).toInt(),
+
+                )
+        }
+    }
+
+    fun isTappedOnLink(eventPointF: PointF): Boolean {
+        val eventPointWithOffset = getDevicePointAtOffset(eventPointF)
+
+        val page = getPageAtOffsetPoint(eventPointWithOffset)
+
+        val pageSize = pdfFileRequired.getScaledPageSize(
+            pageIndex = page,
+            zoom = zoom
+        )
+
+        val pagePointAtOffsetAndZoom = getPagePointAtOffsetAndZoom(page)
+
+        for (link in pdfFileRequired.getPageLinks(page)) {
+            val mapped = pdfFileRequired.mapRectToDevice(
+                page,
+                pagePointAtOffsetAndZoom.x,
+                pagePointAtOffsetAndZoom.y,
+                pageSize.width.toInt(),
+                pageSize.height.toInt(),
+                link.bounds
+            )
+            mapped?.sort()
+            if (mapped?.contains(eventPointWithOffset.x, eventPointWithOffset.y).orFalse()) {
+                callbacks.callLinkHandler(
+                    LinkTapEvent(
+                        originalX = x,
+                        originalY = y,
+                        documentX = eventPointWithOffset.x,
+                        documentY = eventPointWithOffset.y,
+                        mappedLinkRect = mapped.required,
+                        link = link
+                    )
+                )
+                return true
+            }
+        }
+        return false
+    }
+
+    fun isTappedOnSelectionEdgePoints(eventPointF: PointF): Boolean {
+        if (startSelectionRect != null && endSelectionRect != null) {
+            val eventPointWithOffset = getDevicePointAtOffset(eventPointF)
+
+            val page = getPageAtOffsetPoint(eventPointWithOffset)
+
+            if (page == startSelectionRect.required.selectionRect.page) {
+
+                val startDeviceRect = startSelectionRect.required.iconRect
+                val endDeviceRect = endSelectionRect.required.iconRect
+
+                val isOnStartClick = startDeviceRect?.let {
+                    isClickOnRect(it.toRectF(), eventPointWithOffset, tapCompareValue)
+                } ?: false
+
+                val isOnEndClick = endDeviceRect?.let {
+                    isClickOnRect(it.toRectF(), eventPointWithOffset, tapCompareValue)
+                } ?: false
+
+                return isOnStartClick || isOnEndClick
+            }
+        }
+
+        return false
+    }
+
+    fun getDevicePointAtOffset(pointF: PointF): PointF {
+        val mappedX = -currentXOffset + pointF.x
+        val mappedY = -currentYOffset + pointF.y
+
+        return PointF(mappedX, mappedY)
+    }
+
+    fun getPageAtOffsetPoint(offsetPointF: PointF): Int {
+        return pdfFileRequired.getPageAtOffset(
+            offset = if (isSwipeVertical) offsetPointF.y else offsetPointF.x,
+            zoom = zoom
+        )
+    }
+
+    private fun convertDevicePointWithOffsetToPage(pageAtOffset: Int, pointAtOffset: PointF): PointF? {
+        val pageSize = pdfFileRequired.getScaledPageSize(
+            pageAtOffset,
+            zoom
+        )
+
+        val pagePointAtOffsetAndZoom = getPagePointAtOffsetAndZoom(pageAtOffset)
+
+        val convertedPagePoint = pdfFileRequired.mapDeviceCoordinateToPage(
+            pageAtOffset,
+            pagePointAtOffsetAndZoom.x,
+            pagePointAtOffsetAndZoom.y,
+            pageSize.width.toInt(),
+            pageSize.height.toInt(),
+            pointAtOffset.x.toInt(),
+            pointAtOffset.y.toInt()
+        )
+
+        return convertedPagePoint
+    }
+
+    fun setOnLongPress(eventPoint: PointF) {
+        val eventPointWithOffset = getDevicePointAtOffset(eventPoint)
+        val page = getPageAtOffsetPoint(eventPointWithOffset)
+
+        val eventPagePoint = convertDevicePointWithOffsetToPage(page, eventPointWithOffset)
+
+        eventPagePoint?.let {
+            val characterIndex = pdfFileRequired.getCharacterIndex(
+                page,
+                eventPagePoint.x.toDouble(),
+                eventPagePoint.y.toDouble(),
+                eventPagePoint.x.toDouble(),
+                eventPagePoint.y.toDouble()
+            )
+            val characterBox = pdfFileRequired.measureCharacterBox(page, characterIndex)
+            characterBox?.let { characterRect ->
+                if (isClickOnRect(characterRect, eventPagePoint, longPressCompareValue)) {
+                    val (startIndex, endIndex) = getStartEndSelectionPoints(characterIndex, page)
+
+                    val startCharacterBox = pdfFileRequired.measureCharacterBox(page, startIndex)
+                    val endCharacterBox = pdfFileRequired.measureCharacterBox(page, endIndex)
+
+                    if (startCharacterBox != null) {
+                        startSelectionRect =
+                            SelectionRectWithIndex(SelectionRect(page, startCharacterBox), startIndex, null)
+                    }
+
+                    if (endCharacterBox != null) {
+                        endSelectionRect =
+                            SelectionRectWithIndex(SelectionRect(page, endCharacterBox), endIndex, null)
+                    }
+
+                    when {
+                        startSelectionRect != null && endSelectionRect == null -> {
+                            endSelectionRect = startSelectionRect
+                        }
+
+                        endSelectionRect != null && startSelectionRect == null -> {
+                            startSelectionRect = endSelectionRect
+                        }
+
+                        startSelectionRect == null -> {
+                            startSelectionRect =
+                                SelectionRectWithIndex(SelectionRect(page, characterBox), characterIndex, null)
+                            endSelectionRect =
+                                SelectionRectWithIndex(SelectionRect(page, characterBox), characterIndex, null)
+                        }
+                    }
+
+                    selectionRects = getSelectionRects(page)
+                    callbacks.callOnTextSelect(selectionRects.isNotEmpty())
+                }
+            }
+        }
+
+        redraw()
+    }
+
+    fun setOnActionDown(
+        eventPoint: PointF,
+        actionOnPointClick: (isFromStart: Boolean, page: Int) -> Unit,
+        actionToClear: () -> Unit
+    ) {
+        if (startSelectionRect != null && endSelectionRect != null) {
+            val eventPointWithOffset = getDevicePointAtOffset(eventPoint)
+            val page = getPageAtOffsetPoint(eventPointWithOffset)
+
+            if (page == startSelectionRect.required.selectionRect.page) {
+
+                val startDeviceRect = startSelectionRect.required.iconRect
+                val endDeviceRect = endSelectionRect.required.iconRect
+
+                val isOnStartClick = startDeviceRect?.let {
+                    isClickOnRect(it.toRectF(), eventPointWithOffset, tapCompareValue)
+                } ?: false
+
+                if (isOnStartClick) {
+                    actionOnPointClick(true, page)
+                } else {
+                    val isOnEndClick = endDeviceRect?.let {
+                        isClickOnRect(it.toRectF(), eventPointWithOffset, tapCompareValue)
+                    } ?: false
+
+                    if (isOnEndClick) {
+                        actionOnPointClick(false, page)
+                    } else {
+                        actionToClear()
+                    }
+                }
+
+            } else {
+                actionToClear()
+            }
+        } else {
+            actionToClear()
+        }
+    }
+
+    fun setOnActionMove(eventPoint: PointF, pageToSelect: Int, isStartPointMoving: Boolean) {
+        parent.requestDisallowInterceptTouchEvent(true)
+        val eventPointWithOffset = getDevicePointAtOffset(eventPoint)
+        val page = getPageAtOffsetPoint(eventPointWithOffset)
+
+        if (page == pageToSelect) {
+            val eventPagePoint = convertDevicePointWithOffsetToPage(page, eventPointWithOffset)
+            eventPagePoint?.let {
+                val characterIndex = pdfFileRequired.getCharacterIndex(
+                    page,
+                    eventPagePoint.x.toDouble(),
+                    eventPagePoint.y.toDouble(),
+                    eventPagePoint.x.toDouble(),
+                    eventPagePoint.y.toDouble()
+                )
+
+                if (characterIndex >= 0) {
+                    val characterRect = pdfFileRequired.measureCharacterBox(page, characterIndex)
+                    characterRect?.let {
+                        if (isStartPointMoving) {
+                            startSelectionRect = SelectionRectWithIndex(
+                                SelectionRect(page, characterRect),
+                                characterIndex,
+                                null
+                            )
+                        } else {
+                            endSelectionRect = SelectionRectWithIndex(
+                                SelectionRect(page, characterRect),
+                                characterIndex,
+                                null
+                            )
+                        }
+
+                        selectionRects = getSelectionRects(page)
+                        callbacks.callOnTextSelect(selectionRects.isNotEmpty())
+
+                        redraw()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun getStartEndSelectionPoints(clickCharIndex: Int, page: Int): Pair<Int, Int> {
+        return pdfFileRequired.getCountChars(page)?.let { charCounts ->
+            pdfFileRequired.extractCharacters(page, clickCharIndex, 1)?.let { clickCharacter ->
+                val minIndex = 0
+                val maxIndex = charCounts - 1
+
+                val rightCount =
+                    if (clickCharIndex + charsOffsetCount <= maxIndex) charsOffsetCount else maxIndex - clickCharIndex
+                val rightStartIndex = if (rightCount > minIndex) clickCharIndex + 1 else null
+
+                val leftCount = if (clickCharIndex - charsOffsetCount >= minIndex) charsOffsetCount else clickCharIndex
+                val leftStartIndex = if (leftCount > minIndex) clickCharIndex - leftCount else null
+
+                val rightCharacters = rightStartIndex?.let {
+                    pdfFileRequired.extractCharacters(page, rightStartIndex, rightCount)
+                }
+
+                val leftCharacters = if (clickCharacter != space && clickCharacter != paragraph) {
+                    leftStartIndex?.let {
+                        pdfFileRequired.extractCharacters(page, leftStartIndex, leftCount)
+                    }
+                } else null
+
+                val rightIndex = run {
+                    val index = rightCharacters?.indexOfAny(listOf(space, paragraph))
+                    if (index != null && index >= 0) {
+                        index
+                    } else if (!rightCharacters.isNullOrEmpty()) rightCharacters.length
+                    else null
+                }
+
+                val leftIndex = run {
+                    val index = leftCharacters?.reversed()?.indexOfAny(listOf(space, paragraph.reversed()))
+                    if (index != null && index >= 0) {
+                        index
+                    } else if (!leftCharacters.isNullOrEmpty()) leftCharacters.length
+                    else null
+                }
+
+                val startIndexRes = if (leftIndex != null && leftIndex >= 0) {
+                    clickCharIndex - leftIndex
+                } else clickCharIndex
+
+                val endIndexRes = if (rightIndex != null && rightIndex >= 0) {
+                    clickCharIndex + rightIndex
+                } else clickCharIndex
+
+                Pair(startIndexRes, endIndexRes)
+            }
+        } ?: Pair(clickCharIndex, clickCharIndex)
+    }
+
     companion object {
         private val TAG = PDFView::class.java.simpleName
         const val DEFAULT_MAX_SCALE = 3.0f
         const val DEFAULT_MID_SCALE = 1.75f
         const val DEFAULT_MIN_SCALE = 1.0f
+
+        private const val tapCompareValue = 2f
+        const val longPressCompareValue = 20f
+
+        private const val charsOffsetCount = 20
+        private const val drawableWidthCoeff = 0.6
+        private const val drawableHeightStartCoeff = 0.2
+        private const val drawableHeightEndCoeff = 0.8
+
+        private const val paragraph = "\r\n"
+        private const val space = " "
+
+        private fun isClickOnRect(rect: RectF, clickPoint: PointF, compareValue: Float): Boolean {
+            return clickPoint.x >= rect.left - compareValue && clickPoint.x <= rect.right + compareValue &&
+                    clickPoint.y >= rect.top - compareValue && clickPoint.y <= rect.bottom + compareValue
+        }
     }
 
     /**
@@ -1826,6 +2576,11 @@ class PDFView(
         )
         pagesLoader = PagesLoader(this)
         paint = Paint()
+
+        selectionPaint = Paint().apply {
+            color = textSelectionColor
+        }
+
         debugPaint = Paint()
         debugPaint.style = Paint.Style.STROKE
         setWillNotDraw(false)

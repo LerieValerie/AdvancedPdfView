@@ -14,20 +14,21 @@ abstract class FPDFTextSearchContext constructor(
     protected var mHasPrev = false
 
     override fun hasNext(): Boolean {
-        return countResult() > 0 || mHasNext
+        return mHasNext
     }
 
     override fun hasPrev(): Boolean {
-        return countResult() > 0 || mHasPrev
+        return mHasPrev
     }
 
     override fun startSearch() {
         searchNext()
     }
 
-    override fun stopSearch() {}
+    override fun stopSearch() {
+    }
 
     init {
-        prepareSearch()
+        this.prepareSearch()
     }
 }

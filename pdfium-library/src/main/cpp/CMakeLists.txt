@@ -5,6 +5,11 @@
 
 cmake_minimum_required(VERSION 3.4.1)
 
+include(${PROJECT_ROOT_DIR}/common/cmake/base_setup.cmake)
+
+include(${PROJECT_ROOT_DIR}/common/cmake/util.cmake)
+
+
 # Specify where JPEGTurbo libraries are located
 set(Pdfium_DIR ${CMAKE_SOURCE_DIR}/pdfium)
 
@@ -48,4 +53,5 @@ target_link_libraries( # Specifies the target library.
                        jnigraphics
                        android
                        GLESv2
-                       log )
+                       log
+                       util )

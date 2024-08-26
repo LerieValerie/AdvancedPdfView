@@ -19,7 +19,7 @@
 package com.github.barteksc.pdfviewer
 
 import android.graphics.Bitmap
-import android.graphics.Color
+import android.graphics.PointF
 import android.graphics.Rect
 import android.graphics.RectF
 import android.util.SparseBooleanArray
@@ -31,10 +31,8 @@ import org.benjinus.pdfium.Bookmark
 import org.benjinus.pdfium.Link
 import org.benjinus.pdfium.Meta
 import org.benjinus.pdfium.PdfiumSDK
-import org.benjinus.pdfium.search.TextSearchContext
 import org.benjinus.pdfium.util.Size
 import org.benjinus.pdfium.util.SizeF
-import java.util.ArrayList
 import kotlin.math.max
 
 class PdfFile(
@@ -128,7 +126,7 @@ class PdfFile(
      * Calculated document length (width or height, depending on swipe mode)
      */
     private var documentLength = 0f
-    var textHighlightColor = Color.WHITE
+
     private fun setup(viewSize: Size) {
         pagesCount = if (originalUserPages.isNotEmpty()) originalUserPages.size else pdfiumCore.totalPagesCount
         for (i in 0 until pagesCount) {
@@ -162,6 +160,13 @@ class PdfFile(
             startIndex,
             length
         )
+    }
+
+    fun extractText(
+        pageIndex: Int,
+        rect: RectF
+    ): String? {
+        return pdfiumCore.extractText(pageIndex, rect)
     }
 
     fun getTotalPagesCount(): Int {
@@ -235,9 +240,9 @@ class PdfFile(
     private val maxPageSize: SizeF?
         get() = if (isVertical) maxWidthPageSize else maxHeightPageSize
     val maxPageWidth: Float
-        get() = maxPageSize?.width?:0f
+        get() = maxPageSize?.width ?: 0f
     val maxPageHeight: Float
-        get() = maxPageSize?.height?:0f
+        get() = maxPageSize?.height ?: 0f
 
     private fun prepareAutoSpacing(viewSize: Size) {
         pageSpacing.clear()
@@ -395,6 +400,29 @@ class PdfFile(
         return !openedPages[docPage, false]
     }
 
+    fun hasPage(pageIndex: Int): Boolean {
+        return pdfiumCore.hasPage(pageIndex)
+    }
+
+    fun countTextRect(
+        pageIndex: Int,
+        charIndex: Int,
+        count: Int
+    ): Int {
+        return pdfiumCore.countTextRect(
+            pageIndex, charIndex, count
+        )
+    }
+
+    fun getTextRect(
+        pageIndex: Int,
+        rectIndex: Int
+    ): RectF? {
+        return pdfiumCore.getTextRect(
+            pageIndex, rectIndex
+        )
+    }
+
     fun renderPageBitmap(
         bitmap: Bitmap,
         pageIndex: Int,
@@ -412,20 +440,6 @@ class PdfFile(
             bounds.height(),
             annotationRendering,
             colorScheme
-        )
-    }
-
-    fun newPageSearch(
-        pageIndex: Int,
-        query: String,
-        matchCase: Boolean,
-        matchWholeWord: Boolean
-    ): TextSearchContext {
-        return pdfiumCore.newPageSearch(
-            pageIndex,
-            query,
-            matchCase,
-            matchWholeWord
         )
     }
 
@@ -452,6 +466,95 @@ class PdfFile(
             0,
             rect
         )
+    }
+
+    fun mapDeviceCoordinateToPage(
+        pageIndex: Int,
+        startX: Int,
+        startY: Int,
+        sizeX: Int,
+        sizeY: Int,
+        deviceX: Int,
+        deviceY: Int
+    ): PointF? {
+        return pdfiumCore.mapDeviceCoordinateToPage(
+            pageIndex,
+            startX,
+            startY,
+            sizeX,
+            sizeY,
+            0,
+            deviceX,
+            deviceY
+        )
+    }
+
+    suspend fun searchAndHighlight(
+        searchQuery: String,
+        matchCase: Boolean,
+        matchWholeWord: Boolean
+    ) {
+        pdfiumCore.searchAndHighlight(
+            searchQuery = searchQuery,
+            matchCase = matchCase,
+            matchWholeWord = matchWholeWord
+        )
+    }
+
+    suspend fun clearSearchHighlight() {
+        pdfiumCore.clearSearch()
+    }
+
+    fun getRectsByPageIndex(pageIndex: Int) = pdfiumCore.getSearchedRectsByPageIndex(pageIndex)
+
+    fun getFlattenSearchResults() = pdfiumCore.flattenSearchResults
+
+    fun getSearchResultsSize() = getFlattenSearchResults().size
+
+    fun highlightActiveSearchAnnotation(rect: RectF, index: Int) {
+        pdfiumCore.highlightActiveSearchAnnotation(rect, index)
+    }
+
+    fun removeActiveSearchAnnotation() {
+        pdfiumCore.removeActiveSearchAnnotation()
+    }
+
+    suspend fun highlightCurrentSearchIndex(currentIndex: Int, currentRect: RectF) {
+        pdfiumCore.highlightCurrentSearchIndex(currentIndex, currentRect)
+    }
+
+    fun getCharacterIndex(
+        pageIndex: Int,
+        x: Double,
+        y: Double,
+        xTolerance: Double,
+        yTolerance: Double
+    ): Int {
+        return pdfiumCore.getCharacterIndex(
+            pageIndex,
+            x,
+            y,
+            xTolerance,
+            yTolerance
+        )
+    }
+
+    fun measureCharacterBox(
+        pageIndex: Int,
+        index: Int
+    ): RectF? {
+        return pdfiumCore.measureCharacterBox(pageIndex, index)
+    }
+
+    fun getCountChars(pageIndex: Int) =
+        pdfiumCore.nativeTextCountChars(pageIndex)
+
+    fun getCountRects(
+        pageIndex: Int,
+        index: Int,
+        count: Int
+    ): Int? {
+        return pdfiumCore.getCountRects(pageIndex, index, count)
     }
 
     fun dispose() {

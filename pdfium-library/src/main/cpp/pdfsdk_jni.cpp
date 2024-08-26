@@ -43,6 +43,8 @@ extern "C" {
 #include <public/fpdf_text.h>
 #include <public/fpdf_annot.h>
 #include <public/cpp/fpdf_scopers.h>
+#include <util/raio.h>
+#include "util/jniutil.h"
 }
 
 #include <android/native_window.h>
@@ -50,6 +52,8 @@ extern "C" {
 #include <android/bitmap.h>
 #include <public/fpdf_save.h>
 #include <public/fpdf_progressive.h>
+#include <math.h>
+#include "JniService.h"
 
 using namespace android;
 
@@ -90,6 +94,7 @@ class DocumentFile {
 
 public:
     FPDF_DOCUMENT pdfDocument = NULL;
+    jobject reader = NULL;
 
     DocumentFile() { initLibraryIfNeed(); }
 
@@ -98,6 +103,10 @@ public:
 
 DocumentFile::~DocumentFile() {
     if (pdfDocument != NULL) {
+        if (reader != NULL) {
+            getEnv()->DeleteGlobalRef(reader);
+            reader = NULL;
+        }
         FPDF_CloseDocument(pdfDocument);
     }
 
@@ -150,30 +159,6 @@ static char *getErrorDescription(const long error) {
     return description;
 }
 
-int jniThrowException(JNIEnv *env, const char *className, const char *message) {
-    jclass exClass = env->FindClass(className);
-    if (exClass == NULL) {
-        LOGE("Unable to find exception class %s", className);
-        return -1;
-    }
-
-    if (env->ThrowNew(exClass, message) != JNI_OK) {
-        LOGE("Failed throwing '%s' '%s'", className, message);
-        return -1;
-    }
-
-    return 0;
-}
-
-int jniThrowExceptionFmt(JNIEnv *env, const char *className, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    char msgBuf[512];
-    vsnprintf(msgBuf, sizeof(msgBuf), fmt, args);
-    return jniThrowException(env, className, msgBuf);
-    va_end(args);
-}
-
 jobject NewLong(JNIEnv *env, jlong value) {
     jclass cls = env->FindClass("java/lang/Long");
     jmethodID methodID = env->GetMethodID(cls, "<init>", "(J)V");
@@ -224,6 +209,18 @@ static int getBlock(void *param, unsigned long position, unsigned char *outBuffe
     return 1;
 }
 
+static int getBlockWithRandomAccessReader(void *param, unsigned long position, unsigned char *outBuffer,
+                                          unsigned long size) {
+    const auto reader = reinterpret_cast<jobject>(param);
+
+    auto *env = getEnv();
+
+    const int readCount = raio_pread_all(env, reader, outBuffer, size, position);
+    if (readCount < 0) {
+        return 0;
+    }
+    return 1;
+}
 
 JNI_FUNC(jlong, PdfiumSDK, nativeOpenDocument)(JNI_ARGS, jint fd, jstring password) {
 
@@ -271,6 +268,58 @@ JNI_FUNC(jlong, PdfiumSDK, nativeOpenDocument)(JNI_ARGS, jint fd, jstring passwo
     }
 
     docFile->pdfDocument = document;
+
+    return reinterpret_cast<jlong>(docFile);
+}
+
+JNI_FUNC(jlong, PdfiumSDK, nativeOpenCustomDocument)(JNI_ARGS, jobject reader, jlong size,
+                                                     jstring password) {
+    if (size <= 0) {
+        jniThrowException(env, "java/io/IOException",
+                          "File is empty");
+        return -1;
+    }
+
+    DocumentFile *docFile = new DocumentFile();
+
+    jobject readerObject = env->NewGlobalRef(reader);
+
+    FPDF_FILEACCESS loader;
+    loader.m_FileLen = size;
+    loader.m_Param = reinterpret_cast<void *>(readerObject);
+    loader.m_GetBlock = &getBlockWithRandomAccessReader;
+
+    const char *cpassword = NULL;
+    if (password != NULL) {
+        cpassword = env->GetStringUTFChars(password, NULL);
+    }
+
+    FPDF_DOCUMENT document = FPDF_LoadCustomDocument(&loader, cpassword);
+
+    if (cpassword != NULL) {
+        env->ReleaseStringUTFChars(password, cpassword);
+    }
+
+    if (!document) {
+        delete docFile;
+
+        const long errorNum = FPDF_GetLastError();
+        if (errorNum == FPDF_ERR_PASSWORD) {
+            jniThrowException(env, "org/benjinus/pdfium/PdfPasswordException",
+                              "Password required or incorrect password.");
+        } else {
+            char *error = getErrorDescription(errorNum);
+            jniThrowExceptionFmt(env, "java/io/IOException",
+                                 "cannot create document: %s", error);
+
+            free(error);
+        }
+
+        return -1;
+    }
+
+    docFile->pdfDocument = document;
+    docFile->reader = readerObject;
 
     return reinterpret_cast<jlong>(docFile);
 }
@@ -602,7 +651,7 @@ JNI_FUNC(void, PdfiumSDK, nativeRenderPageBitmap)(JNI_ARGS, jlong pagePtr, jobje
 //Формат ARGB
 //0xFF000000 - черный с альфой 100%
     if (colors != NULL) {
-        jint * arr = env->GetIntArrayElements(colors, NULL);
+        jint *arr = env->GetIntArrayElements(colors, NULL);
         jint byte1 = arr[0];
         jint byte2 = arr[1];
         jint byte3 = arr[2];
@@ -611,7 +660,8 @@ JNI_FUNC(void, PdfiumSDK, nativeRenderPageBitmap)(JNI_ARGS, jlong pagePtr, jobje
 
         const FPDF_COLORSCHEME color_scheme{
                 /*path_fill_color=*/(FPDF_DWORD) byte1, // Цвет заливки (форм?, цитат?, сносок?, хз...)
-                /*path_stroke_color=*/(FPDF_DWORD) byte2, //Цвет строчек??? всяких подчеркиваний, рамок таблиц и т.п. По идее должен быть такой же как цвет текста
+                /*path_stroke_color=*/
+                                    (FPDF_DWORD) byte2, //Цвет строчек??? всяких подчеркиваний, рамок таблиц и т.п. По идее должен быть такой же как цвет текста
                 /*text_fill_color=*/(FPDF_DWORD) byte3, //Цвет текста
                 /*text_stroke_color=*/(FPDF_DWORD) byte4
         };
@@ -778,11 +828,13 @@ JNI_FUNC(jobject, PdfiumSDK, nativePageCoordinateToDevice)(JNI_ARGS, jlong pageP
     FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
     int deviceX, deviceY;
 
-    FPDF_PageToDevice(page, startX, startY, sizeX, sizeY, rotate, pageX, pageY, &deviceX, &deviceY);
+    jboolean isConverted = FPDF_PageToDevice(page, startX, startY, sizeX, sizeY, rotate, pageX, pageY, &deviceX, &deviceY);
 
-    jclass clazz = env->FindClass("android/graphics/Point");
-    jmethodID constructorID = env->GetMethodID(clazz, "<init>", "(II)V");
-    return env->NewObject(clazz, constructorID, deviceX, deviceY);
+    if (isConverted) {
+        jclass clazz = env->FindClass("android/graphics/Point");
+        jmethodID constructorID = env->GetMethodID(clazz, "<init>", "(II)V");
+        return env->NewObject(clazz, constructorID, deviceX, deviceY);
+    } else return NULL;
 }
 
 JNI_FUNC(jobject, PdfiumSDK, nativeDeviceCoordinateToPage)(JNI_ARGS, jlong pagePtr, jint startX,
@@ -792,11 +844,13 @@ JNI_FUNC(jobject, PdfiumSDK, nativeDeviceCoordinateToPage)(JNI_ARGS, jlong pageP
     FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
     double pageX, pageY;
 
-    FPDF_DeviceToPage(page, startX, startY, sizeX, sizeY, rotate, deviceX, deviceY, &pageX, &pageY);
+    jboolean isConverted = FPDF_DeviceToPage(page, startX, startY, sizeX, sizeY, rotate, deviceX, deviceY, &pageX, &pageY);
 
-    jclass clazz = env->FindClass("android/graphics/PointF");
-    jmethodID constructorID = env->GetMethodID(clazz, "<init>", "(FF)V");
-    return env->NewObject(clazz, constructorID, pageX, pageY);
+    if (isConverted) {
+        jclass clazz = env->FindClass("android/graphics/PointF");
+        jmethodID constructorID = env->GetMethodID(clazz, "<init>", "(FF)V");
+        return env->NewObject(clazz, constructorID, pageX, pageY);
+    } else return NULL;
 }
 
 JNI_FUNC(jint, PdfiumSDK, nativeGetPageRotation)(JNI_ARGS, jlong pagePtr) {
@@ -899,6 +953,20 @@ JNI_FUNC(jdoubleArray, PdfiumSDK, nativeTextGetCharBox)(JNI_ARGS, jlong textPage
     return result;
 }
 
+JNI_FUNC(jobject, PdfiumSDK, nativeTextGetCharOrigin)(JNI_ARGS, jlong textPagePtr, jint index) {
+    FPDF_TEXTPAGE textPage = reinterpret_cast<FPDF_TEXTPAGE>(textPagePtr);
+
+    double originX, originY;
+
+    jboolean result = FPDFText_GetCharOrigin(textPage, index, &originX, &originY);
+
+    if (result) {
+        jclass clazz = env->FindClass("android/graphics/PointF");
+        jmethodID constructorID = env->GetMethodID(clazz, "<init>", "(FF)V");
+        return env->NewObject(clazz, constructorID, originX, originY);
+    } else return NULL;
+}
+
 JNI_FUNC(jint, PdfiumSDK, nativeTextGetCharIndexAtPos)(JNI_ARGS, jlong textPagePtr, jdouble x,
                                                        jdouble y, jdouble xTolerance,
                                                        jdouble yTolerance) {
@@ -939,11 +1007,12 @@ JNI_FUNC(jdoubleArray, PdfiumSDK, nativeTextGetRect)(JNI_ARGS, jlong textPagePtr
         return NULL;
     }
     double fill[4];
-    FPDFText_GetRect(textPage, (int) rect_index, &fill[0], &fill[1], &fill[2], &fill[3]);
-    env->SetDoubleArrayRegion(result, 0, 4, (jdouble *) fill);
-    return result;
+    jboolean isSuccessful = FPDFText_GetRect(textPage, (int) rect_index, &fill[0], &fill[1], &fill[2], &fill[3]);
+    if (isSuccessful) {
+        env->SetDoubleArrayRegion(result, 0, 4, (jdouble *) fill);
+        return result;
+    } else return NULL;
 }
-
 
 JNI_FUNC(jint, PdfiumSDK, nativeTextGetBoundedTextLength)(JNI_ARGS, jlong textPagePtr,
                                                           jdouble left,
@@ -991,7 +1060,7 @@ unsigned short *convertWideString(JNIEnv *env, jstring query) {
     unsigned short *result = static_cast<unsigned short *>(malloc(length));
     char *ptr = reinterpret_cast<char *>(result);
     size_t i = 0;
-    for (wchar_t w : value) {
+    for (wchar_t w: value) {
         ptr[i++] = w & 0xff;
         ptr[i++] = (w >> 8) & 0xff;
     }
@@ -1050,24 +1119,18 @@ JNI_FUNC(jint, PdfiumSDK, nativeCountSearchResult)(JNI_ARGS, jlong searchHandleP
 //////////////////////////////////////////
 // Begin PDF Annotation api
 //////////////////////////////////////////
-JNI_FUNC(jlong, PdfiumSDK, nativeAddTextAnnotation)(JNI_ARGS, jlong docPtr, int page_index,
-                                                    jstring text_,
-                                                    jintArray color_, jintArray bound_) {
 
-    FPDF_PAGE page;
-    DocumentFile *doc = reinterpret_cast<DocumentFile *>(docPtr);
-    int pagePtr = loadPageInternal(env, doc, page_index);
-    if (pagePtr == -1) {
-        return -1;
-    } else {
-        page = reinterpret_cast<FPDF_PAGE>(pagePtr);
-    }
+JNI_FUNC(jboolean , PdfiumSDK, nativeAddHighlightAnnotation)(JNI_ARGS, jlong pagePtr,
+                                                         jboolean isColorRequired, jintArray color, jfloatArray bound,
+                                                         jstring key, jshortArray value) {
+
+    FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
 
     // Get the bound array
-    jint *bounds = env->GetIntArrayElements(bound_, NULL);
-    int boundsLen = (int) (env->GetArrayLength(bound_));
+    jfloat *bounds = env->GetFloatArrayElements(bound, NULL);
+    int boundsLen = (int) (env->GetArrayLength(bound));
     if (boundsLen != 4) {
-        return -1;
+        return false;
     }
 
     // Set the annotation rectangle.
@@ -1077,10 +1140,132 @@ JNI_FUNC(jlong, PdfiumSDK, nativeAddTextAnnotation)(JNI_ARGS, jlong docPtr, int 
     rect.right = bounds[2];
     rect.bottom = bounds[3];
 
-    // Get the text color
+    // Add a text annotation to the page.
+    FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_HIGHLIGHT);
+//    FPDFAnnot_SetFlags(annot, 4);
+
+    // Set the color of the annotation.
+    if (isColorRequired) {
+        unsigned int R, G, B, A;
+        jint *colors = env->GetIntArrayElements(color, NULL);
+        int colorsLen = (int) (env->GetArrayLength(color));
+        if (colorsLen == 4) {
+            R = colors[0];
+            G = colors[1];
+            B = colors[2];
+            A = colors[3];
+        } else {
+            R = 51u;
+            G = 102u;
+            B = 153u;
+            A = 204u;
+        }
+
+        jboolean isColored = FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, R, G, B, A);
+        env->ReleaseIntArrayElements(color, colors, 0);
+    }
+
+    // set the rectangle of the annotation
+    FPDFAnnot_SetRect(annot, &rect);
+    env->ReleaseFloatArrayElements(bound, bounds, 0);
+
+    float x = rect.left, y = rect.top, x1 = rect.right, y1 = rect.bottom;
+
+    FS_QUADPOINTSF quadpoints{x, y, x1, y, x, y1, x1, y1};
+
+    FPDFAnnot_AppendAttachmentPoints(annot, &quadpoints);
+
+    std::string annotationKey = getStringByJavaString(env, key);
+    auto keyString = annotationKey.c_str();
+
+    jboolean isCopy = 0;
+    unsigned short *arr = (unsigned short *) env->GetShortArrayElements(value, &isCopy);
+
+    jboolean isSet = FPDFAnnot_SetStringValue(annot, keyString, arr);
+
+    if (isCopy) {
+        env->ReleaseShortArrayElements(value, (jshort *) arr, JNI_ABORT);
+    }
+
+    FPDFPage_CloseAnnot(annot);
+    return true;
+}
+
+JNI_FUNC(jint, PdfiumSDK, nativeGetAnnotationCount)(JNI_ARGS, jlong pagePtr) {
+
+    FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
+    return FPDFPage_GetAnnotCount(page);
+}
+
+JNI_FUNC(jlong, PdfiumSDK, nativeGetAnnotation)(JNI_ARGS, jlong pagePtr, jint annotationIndex) {
+
+    FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
+    auto annotation = FPDFPage_GetAnnot(page, annotationIndex);
+    return reinterpret_cast<jlong>(annotation);
+}
+
+JNI_FUNC(void, PdfiumSDK, nativeRemoveAllAnnotationsWithKey)(JNI_ARGS, jlong pagePtr, jstring key) {
+
+    FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
+
+    std::string annotationKey = getStringByJavaString(env, key);
+    auto keyString = annotationKey.c_str();
+
+    int index = 0;
+    while (true) {
+        int count = FPDFPage_GetAnnotCount(page);
+
+        if (index < count) {
+            auto annotation = FPDFPage_GetAnnot(page, index);
+            jboolean keyExists = FPDFAnnot_HasKey(annotation, keyString);
+            if (keyExists) {
+                jboolean isRemoved = FPDFPage_RemoveAnnot(page, index);
+            } else {
+                index++;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+JNI_FUNC(jboolean, PdfiumSDK, nativeRemoveAnnotation)(JNI_ARGS, jlong pagePtr, jint index) {
+
+    FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
+
+    return FPDFPage_RemoveAnnot(page, index);
+}
+
+JNI_FUNC(jlong, PdfiumSDK, nativeGetAnnotationValueByKey)(JNI_ARGS, jlong annotationPtr, jstring key,
+                                                          jshortArray value) {
+    std::string annotationKey = getStringByJavaString(env, key);
+    auto keyString = annotationKey.c_str();
+
+    FPDF_ANNOTATION annotation = reinterpret_cast<FPDF_ANNOTATION>(annotationPtr);
+
+    jboolean isCopy = 0;
+    unsigned short *buffer = NULL;
+    int bufLen = 0;
+    if (value != NULL) {
+        buffer = (unsigned short *) env->GetShortArrayElements(value, &isCopy);
+        bufLen = env->GetArrayLength(value);
+    }
+    jlong output = (jlong) FPDFAnnot_GetStringValue(annotation, keyString, buffer, bufLen);
+
+    if (isCopy) {
+        env->SetShortArrayRegion(value, 0, output, (jshort *) buffer);
+        env->ReleaseShortArrayElements(value, (jshort *) buffer, JNI_ABORT);
+    }
+    return output;
+}
+
+JNI_FUNC(jboolean, PdfiumSDK, nativeSetAnnotationColor)(JNI_ARGS, jlong annotationPtr,
+                                                        jintArray color) {
+    FPDF_ANNOTATION annotation = reinterpret_cast<FPDF_ANNOTATION>(annotationPtr);
+
     unsigned int R, G, B, A;
-    jint *colors = env->GetIntArrayElements(color_, NULL);
-    int colorsLen = (int) (env->GetArrayLength(color_));
+    jint *colors = env->GetIntArrayElements(color, NULL);
+    int colorsLen = (int) (env->GetArrayLength(color));
     if (colorsLen == 4) {
         R = colors[0];
         G = colors[1];
@@ -1093,41 +1278,16 @@ JNI_FUNC(jlong, PdfiumSDK, nativeAddTextAnnotation)(JNI_ARGS, jlong docPtr, int 
         A = 204u;
     }
 
-    // Add a text annotation to the page.
-    FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_TEXT);
+    jboolean isColored = FPDFAnnot_SetColor(annotation, FPDFANNOT_COLORTYPE_InteriorColor, R, G, B, A);
+    env->ReleaseIntArrayElements(color, colors, 0);
 
-    // set the rectangle of the annotation
-    FPDFAnnot_SetRect(annot, &rect);
-    env->ReleaseIntArrayElements(bound_, bounds, 0);
+    return isColored;
+}
 
-    // Set the color of the annotation.
-    FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, R, G, B, A);
-    env->ReleaseIntArrayElements(color_, colors, 0);
+JNI_FUNC(void, PdfiumSDK, nativeCloseAnnotation)(JNI_ARGS, jlong annotationPtr) {
+    FPDF_ANNOTATION annotation = reinterpret_cast<FPDF_ANNOTATION>(annotationPtr);
 
-    // Set the content of the annotation.
-    unsigned short *kContents = convertWideString(env, text_);
-    FPDFAnnot_SetStringValue(annot, kContentsKey, kContents);
-
-    // save page
-    FPDF_DOCUMENT pdfDoc = doc->pdfDocument;
-    if (!FPDF_SaveAsCopy(pdfDoc, NULL, FPDF_INCREMENTAL)) {
-        return -1;
-    }
-
-    // close page
-    closePageInternal(pagePtr);
-
-    // reload page
-    pagePtr = loadPageInternal(env, doc, page_index);
-
-    jclass clazz = env->FindClass("org/benjinus/pdfium/PdfiumSDK");
-    jmethodID callback = env->GetMethodID(clazz, "onAnnotationAdded",
-                                          "(Ljava/lang/Integer;)Ljava/lang/Long;");
-    env->CallObjectMethod(thiz, callback, page_index, pagePtr);
-
-    return reinterpret_cast<jlong>(annot);
+    FPDFPage_CloseAnnot(annotation);
 }
 
 }//extern C
-
-#pragma clang diagnostic pop

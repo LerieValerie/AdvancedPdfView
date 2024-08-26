@@ -18,7 +18,7 @@ import org.benjinus.pdfium.R
 class DefaultScrollHandle @JvmOverloads constructor(
     context: Context,
     private val inverted: Boolean = false
-): RelativeLayout(context), ScrollHandle {
+) : RelativeLayout(context), ScrollHandle {
     private var relativeHandlerMiddle = 0f
     private var textView: TextView = TextView(context)
     private var pdfView: PDFView? = null
@@ -244,6 +244,7 @@ class DefaultScrollHandle @JvmOverloads constructor(
                 }
                 return true
             }
+
             MotionEvent.ACTION_MOVE -> {
                 if (pdfView?.isSwipeVertical == true) {
                     setPosition(event.rawY - currentPos + relativeHandlerMiddle)
@@ -260,6 +261,7 @@ class DefaultScrollHandle @JvmOverloads constructor(
                 }
                 return true
             }
+
             MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
                 hideDelayed()
                 pdfView?.performPageSnap()

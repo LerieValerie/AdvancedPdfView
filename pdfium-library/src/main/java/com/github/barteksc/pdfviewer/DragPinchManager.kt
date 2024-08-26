@@ -27,7 +27,6 @@ import android.view.ScaleGestureDetector
 import android.view.ScaleGestureDetector.OnScaleGestureListener
 import android.view.View
 import android.view.View.OnTouchListener
-import com.github.barteksc.pdfviewer.model.LinkTapEvent
 import com.github.barteksc.pdfviewer.util.Constants.Pinch.MAXIMUM_ZOOM
 import com.github.barteksc.pdfviewer.util.Constants.Pinch.MINIMUM_ZOOM
 import kotlin.math.abs
@@ -41,7 +40,7 @@ import kotlin.math.min
 internal class DragPinchManager @SuppressLint("ClickableViewAccessibility") constructor(
     private val pdfView: PDFView,
     private val animationManager: AnimationManager
-): GestureDetector.OnGestureListener, OnDoubleTapListener, OnScaleGestureListener, OnTouchListener {
+) : GestureDetector.OnGestureListener, OnDoubleTapListener, OnScaleGestureListener, OnTouchListener {
 
     private val gestureDetector: GestureDetector = GestureDetector(
         pdfView.context,
@@ -53,6 +52,8 @@ internal class DragPinchManager @SuppressLint("ClickableViewAccessibility") cons
     )
     private var scrolling = false
     private var scaling = false
+    private var selectionMode = SelectionMode()
+
     private var enabled = false
     fun enable() {
         enabled = true
@@ -67,90 +68,26 @@ internal class DragPinchManager @SuppressLint("ClickableViewAccessibility") cons
     }
 
     override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-        val onTapHandled = pdfView.callbacks.callOnTap(e)
-        val linkTapped = checkLinkTapped(
-            e.x,
-            e.y
-        )
-        if (!onTapHandled && !linkTapped) {
-            val ps = pdfView.scrollHandle
-            if (ps != null && !pdfView.documentFitsView()) {
-                if (!ps.shown()) {
-                    ps.show()
-                } else {
-                    ps.hide()
+        if (!pdfView.isTappedOnSelectionEdgePoints(PointF(e.x, e.y))) {
+            clearSelection()
+
+            val onTapHandled = pdfView.callbacks.callOnTap(e)
+
+            val isLinkTapped = pdfView.isTappedOnLink(PointF(e.x, e.y))
+            if (!onTapHandled && !isLinkTapped) {
+                val ps = pdfView.scrollHandle
+                if (ps != null && !pdfView.documentFitsView()) {
+                    if (!ps.shown()) {
+                        ps.show()
+                    } else {
+                        ps.hide()
+                    }
                 }
             }
         }
+
         pdfView.performClick()
         return true
-    }
-
-    private fun checkLinkTapped(
-        x: Float,
-        y: Float
-    ): Boolean {
-        val pdfFile = pdfView.pdfFile ?: return false
-        val mappedX = -pdfView.currentXOffset + x
-        val mappedY = -pdfView.currentYOffset + y
-        val page = pdfFile.getPageAtOffset(
-            if (pdfView.isSwipeVertical) mappedY else mappedX,
-            pdfView.zoom
-        )
-        val pageSize = pdfFile.getScaledPageSize(
-            page,
-            pdfView.zoom
-        )
-        val pageX: Int
-        val pageY: Int
-        if (pdfView.isSwipeVertical) {
-            pageX = pdfFile.getSecondaryPageOffset(
-                page,
-                pdfView.zoom
-            ).toInt()
-            pageY = pdfFile.getPageOffset(
-                page,
-                pdfView.zoom
-            ).toInt()
-        } else {
-            pageY = pdfFile.getSecondaryPageOffset(
-                page,
-                pdfView.zoom
-            ).toInt()
-            pageX = pdfFile.getPageOffset(
-                page,
-                pdfView.zoom
-            ).toInt()
-        }
-        for (link in pdfFile.getPageLinks(page)) {
-            val mapped = pdfFile.mapRectToDevice(
-                page,
-                pageX,
-                pageY,
-                pageSize.width.toInt(),
-                pageSize.height.toInt(),
-                link.bounds
-            )
-            mapped?.sort()
-            if (mapped?.contains(
-                    mappedX,
-                    mappedY
-                ) == true
-            ) {
-                pdfView.callbacks.callLinkHandler(
-                    LinkTapEvent(
-                        x,
-                        y,
-                        mappedX,
-                        mappedY,
-                        mapped,
-                        link
-                    )
-                )
-                return true
-            }
-        }
-        return false
     }
 
     private fun startPageFling(
@@ -206,6 +143,7 @@ internal class DragPinchManager @SuppressLint("ClickableViewAccessibility") cons
                     pdfView.midZoom
                 )
             }
+
             pdfView.zoom < pdfView.maxZoom -> {
                 pdfView.zoomWithAnimation(
                     e.x,
@@ -213,6 +151,7 @@ internal class DragPinchManager @SuppressLint("ClickableViewAccessibility") cons
                     pdfView.maxZoom
                 )
             }
+
             else -> {
                 pdfView.resetZoomWithAnimation()
             }
@@ -234,12 +173,12 @@ internal class DragPinchManager @SuppressLint("ClickableViewAccessibility") cons
         return false
     }
 
-    override fun onScroll(
-        e1: MotionEvent,
-        e2: MotionEvent,
-        distanceX: Float,
-        distanceY: Float
-    ): Boolean {
+    override fun onScroll(e1: MotionEvent?, e2: MotionEvent, distanceX: Float, distanceY: Float): Boolean {
+        scrollView(distanceX, distanceY)
+        return true
+    }
+
+    fun scrollView(distanceX: Float, distanceY: Float) {
         scrolling = true
         if (pdfView.isZooming() || pdfView.isSwipeEnabled()) {
             pdfView.moveRelativeTo(
@@ -250,7 +189,6 @@ internal class DragPinchManager @SuppressLint("ClickableViewAccessibility") cons
         if (!scaling || pdfView.doRenderDuringScale()) {
             pdfView.loadPageByOffset()
         }
-        return true
     }
 
     private fun onScrollEnd(event: MotionEvent) {
@@ -262,15 +200,20 @@ internal class DragPinchManager @SuppressLint("ClickableViewAccessibility") cons
     }
 
     override fun onLongPress(e: MotionEvent) {
-        pdfView.callbacks.callOnLongPress(e)
+        if (!selectionMode.isSelection) {
+            clearSelection()
+
+            pdfView.setOnLongPress(PointF(e.x, e.y))
+        }
     }
 
-    override fun onFling(
-        e1: MotionEvent,
-        e2: MotionEvent,
-        velocityX: Float,
-        velocityY: Float
-    ): Boolean {
+    private fun clearSelection() {
+        selectionMode.clear()
+        pdfView.clearSelection()
+        pdfView.callbacks.callOnTextSelect(false)
+    }
+
+    override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
         if (!pdfView.isSwipeEnabled()) {
             return false
         }
@@ -282,7 +225,7 @@ internal class DragPinchManager @SuppressLint("ClickableViewAccessibility") cons
                 )
             } else {
                 startPageFling(
-                    e1,
+                    e1 ?: e2,
                     e2,
                     velocityX,
                     velocityY
@@ -296,11 +239,11 @@ internal class DragPinchManager @SuppressLint("ClickableViewAccessibility") cons
         val minY: Float
         val pdfFile = pdfView.pdfFile
         if (pdfView.isSwipeVertical) {
-            minX = -(pdfView.toCurrentScale(pdfFile?.maxPageWidth?:0f) - pdfView.width)
-            minY = -((pdfFile?.getDocLen(pdfView.zoom)?:0f) - pdfView.height)
+            minX = -(pdfView.toCurrentScale(pdfFile?.maxPageWidth ?: 0f) - pdfView.width)
+            minY = -((pdfFile?.getDocLen(pdfView.zoom) ?: 0f) - pdfView.height)
         } else {
-            minX = -((pdfFile?.getDocLen(pdfView.zoom)?:0f) - pdfView.width)
-            minY = -(pdfView.toCurrentScale(pdfFile?.maxPageHeight?:0f) - pdfView.height)
+            minX = -((pdfFile?.getDocLen(pdfView.zoom) ?: 0f) - pdfView.width)
+            minY = -(pdfView.toCurrentScale(pdfFile?.maxPageHeight ?: 0f) - pdfView.height)
         }
         animationManager.startFlingAnimation(
             xOffset,
@@ -325,23 +268,24 @@ internal class DragPinchManager @SuppressLint("ClickableViewAccessibility") cons
         val pageStart = -(pdfFile?.getPageOffset(
             pdfView.currentPage,
             pdfView.zoom
-        )?:0f)
+        ) ?: 0f)
         val pageEnd = pageStart - (pdfFile?.getPageLength(
             pdfView.currentPage,
             pdfView.zoom
-        )?:0f)
+        ) ?: 0f)
+
         val minX: Float
         val minY: Float
         val maxX: Float
         val maxY: Float
         if (pdfView.isSwipeVertical) {
-            minX = -(pdfView.toCurrentScale(pdfFile?.maxPageWidth?:0f) - pdfView.width)
+            minX = -(pdfView.toCurrentScale(pdfFile?.maxPageWidth ?: 0f) - pdfView.width)
             minY = pageEnd + pdfView.height
             maxX = 0f
             maxY = pageStart
         } else {
             minX = pageEnd + pdfView.width
-            minY = -(pdfView.toCurrentScale(pdfFile?.maxPageHeight?:0f) - pdfView.height)
+            minY = -(pdfView.toCurrentScale(pdfFile?.maxPageHeight ?: 0f) - pdfView.height)
             maxX = pageStart
             maxY = 0f
         }
@@ -404,10 +348,34 @@ internal class DragPinchManager @SuppressLint("ClickableViewAccessibility") cons
         }
         var retVal = scaleGestureDetector.onTouchEvent(event)
         retVal = gestureDetector.onTouchEvent(event) || retVal
-        if (event.action == MotionEvent.ACTION_UP) {
-            if (scrolling) {
-                scrolling = false
-                onScrollEnd(event)
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                pdfView.setOnActionDown(
+                    PointF(event.x, event.y),
+                    actionOnPointClick = { isFromStart: Boolean, page: Int ->
+                        selectionMode.setSelection(isSelection = true, isFromStart = isFromStart, page = page)
+                    },
+                    actionToClear = {
+                        selectionMode.clear()
+                    }
+                )
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                if (selectionMode.isSelection) {
+                    pdfView.setOnActionMove(
+                        eventPoint = PointF(event.x, event.y),
+                        pageToSelect = selectionMode.page,
+                        isStartPointMoving = selectionMode.isStartPositionMoving
+                    )
+                }
+            }
+
+            MotionEvent.ACTION_UP -> {
+                if (scrolling) {
+                    scrolling = false
+                    onScrollEnd(event)
+                }
             }
         }
         return retVal
@@ -431,5 +399,28 @@ internal class DragPinchManager @SuppressLint("ClickableViewAccessibility") cons
 
     init {
         pdfView.setOnTouchListener(this)
+    }
+
+    class SelectionMode {
+        var isSelection: Boolean = false
+        var isStartPositionMoving: Boolean = false
+        var isEndPositionMoving: Boolean = false
+        var page: Int = -1
+
+        fun clear() {
+            isSelection = false
+            isStartPositionMoving = false
+            isEndPositionMoving = false
+            page = -1
+        }
+
+        fun setSelection(isSelection: Boolean, isFromStart: Boolean, page: Int) {
+            if (isSelection) {
+                this.isSelection = true
+                isStartPositionMoving = isFromStart
+                isEndPositionMoving = !isFromStart
+                this.page = page
+            } else clear()
+        }
     }
 }

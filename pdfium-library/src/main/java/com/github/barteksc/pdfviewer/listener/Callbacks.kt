@@ -28,6 +28,8 @@ class Callbacks {
      */
     private var onLoadCompleteListener: OnLoadCompleteListener? = null
 
+    private var onLoadStartListener: OnLoadStartListener? = null
+
     /**
      * Call back object to call when document loading error occurs
      */
@@ -64,6 +66,10 @@ class Callbacks {
      */
     private var onTapListener: OnTapListener? = null
 
+    private var onTextSelectListener: OnTextSelectListener? = null
+
+    private var onTextSearchListener: OnTextSearchListener? = null
+
     /**
      * Call back object to call when the user does a long tap gesture
      */
@@ -80,6 +86,16 @@ class Callbacks {
     fun callOnLoadComplete(pagesCount: Int) {
         if (onLoadCompleteListener != null) {
             onLoadCompleteListener?.loadComplete(pagesCount)
+        }
+    }
+
+    fun setOnLoadStart(onLoadStartListener: OnLoadStartListener?) {
+        this.onLoadStartListener = onLoadStartListener
+    }
+
+    fun callOnLoadStart() {
+        if (onLoadStartListener != null) {
+            onLoadStartListener?.onLoadStart()
         }
     }
 
@@ -149,6 +165,22 @@ class Callbacks {
 
     fun callOnTap(event: MotionEvent?): Boolean {
         return onTapListener?.onTap(event) == true
+    }
+
+    fun setOnTextSelect(onTextSelectListener: OnTextSelectListener?) {
+        this.onTextSelectListener = onTextSelectListener
+    }
+
+    fun callOnTextSelect(isSelected: Boolean) {
+        onTextSelectListener?.onTextSelect(isSelected)
+    }
+
+    fun setOnTextSearch(onTextSearchListener: OnTextSearchListener?) {
+        this.onTextSearchListener = onTextSearchListener
+    }
+
+    fun callOnTextSearch(isCompleted: Boolean) {
+        onTextSearchListener?.onTextSearch(isCompleted)
     }
 
     fun setOnLongPress(onLongPressListener: OnLongPressListener?) {

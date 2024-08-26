@@ -40,7 +40,6 @@ internal class DecodingTask(
                 autoSpacing = pdfView.isAutoSpacingEnabled(),
                 fitEachPage = pdfView.isFitEachPage
             )
-            pdfFile?.textHighlightColor = pdfView.getTextHighlightColor()
             pdfFile
         } else {
             throw NullPointerException("pdfView == null")

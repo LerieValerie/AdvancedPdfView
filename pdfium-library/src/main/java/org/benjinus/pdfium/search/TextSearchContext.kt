@@ -8,11 +8,10 @@ interface TextSearchContext {
     val query: String?
     val isMatchCase: Boolean
     val isMatchWholeWord: Boolean
-    fun countResult(): Int
     operator fun hasNext(): Boolean
     fun hasPrev(): Boolean
-    fun searchNext(): RectF?
-    fun searchPrev(): RectF?
+    fun searchNext(): List<RectF>
+    fun searchPrev(): List<RectF>
     fun startSearch()
     fun stopSearch()
 }
