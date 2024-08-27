@@ -30,6 +30,20 @@ android {
         }
 
     }
+
+    buildTypes {
+        release {
+            ndk {
+                abiFilters += listOf("arm64-v8a", "x86_64", "x86", "armeabi-v7a")
+            }
+        }
+        debug {
+            ndk {
+                abiFilters += listOf("arm64-v8a", "x86_64", "x86")
+            }
+        }
+    }
+
     ndkVersion = "25.2.9519653"
 
     externalNativeBuild {
@@ -47,6 +61,12 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
+    }
+}
+
+tasks.whenTaskAdded {
+    if (name.startsWith("buildCMake")) {
+        dependsOn("${Modules.Core.data}:$name")
     }
 }
 
